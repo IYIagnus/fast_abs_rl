@@ -22,25 +22,60 @@ from decoding import Abstractor, RLExtractor, DecodeDataset, BeamAbstractor
 from decoding import make_html_safe
 
 
-def decode(save_path, model_dir, split, batch_size,
-           beam_size, diverse, max_len, cuda):
+class Model:
+    def __init__(self, model_dir, beam_size, diverse, max_len, cuda):
+        self.extractor, self.abstractor, self.meta = self.load_model(model_dir, beam_size, max_len, cuda)
+        self.beam_size = beam_size
+        self.diverse = diverse
+        self.max_len = max_len
+        self.cuda = cuda
+
+    def load_model(self, model_dir, beam_size, max_len, cuda):
+        with open(join(model_dir, 'meta.json')) as f:
+            meta = json.loads(f.read())
+        if meta['net_args']['abstractor'] is None:
+            # NOTE: if no abstractor is provided then
+            #       the whole model would be extractive summarization
+            assert beam_size == 1
+            abstractor = identity
+        else:
+            if beam_size == 1:
+                abstractor = Abstractor(join(model_dir, 'abstractor'),
+                                        max_len, cuda)
+            else:
+                abstractor = BeamAbstractor(join(model_dir, 'abstractor'),
+                                            max_len, cuda)
+        extractor = RLExtractor(model_dir, cuda=cuda)
+        return extractor, abstractor, meta
+
+    def decode(self, raw_article_batch):
+        tokenized_article_batch = map(tokenize(None), raw_article_batch)
+        ext_arts = []
+        ext_inds = []
+        for raw_art_sents in tokenized_article_batch:
+            ext = self.extractor(raw_art_sents)[:-1]  # exclude EOE
+            if not ext:
+                # use top-5 if nothing is extracted
+                # in some rare cases rnn-ext does not extract at all
+                ext = list(range(5))[:len(raw_art_sents)]
+            else:
+                ext = [i.item() for i in ext]
+            ext_inds += [(len(ext_arts), len(ext))]
+            ext_arts += [raw_art_sents[i] for i in ext]
+        if self.beam_size > 1:
+            all_beams = self.abstractor(ext_arts, self.beam_size, self.diverse)
+            dec_outs = rerank_mp(all_beams, ext_inds)
+        else:
+            dec_outs = self.abstractor(ext_arts)
+        return dec_outs, ext_inds
+
+
+def decode_all(save_path, model_dir, split, batch_size,
+               beam_size, diverse, max_len, cuda):
     start = time()
     # setup model
-    with open(join(model_dir, 'meta.json')) as f:
-        meta = json.loads(f.read())
-    if meta['net_args']['abstractor'] is None:
-        # NOTE: if no abstractor is provided then
-        #       the whole model would be extractive summarization
-        assert beam_size == 1
-        abstractor = identity
-    else:
-        if beam_size == 1:
-            abstractor = Abstractor(join(model_dir, 'abstractor'),
-                                    max_len, cuda)
-        else:
-            abstractor = BeamAbstractor(join(model_dir, 'abstractor'),
-                                        max_len, cuda)
-    extractor = RLExtractor(model_dir, cuda=cuda)
+    model = Model(model_dir, beam_size,
+                  diverse, max_len, cuda)
 
     # setup loader
     def coll(batch):
@@ -55,14 +90,14 @@ def decode(save_path, model_dir, split, batch_size,
     )
 
     # prepare save paths and logs
-    os.makedirs(join(save_path, 'output'))
+    os.makedirs(join(save_path, 'output'), exist_ok=True)
     dec_log = {}
-    dec_log['abstractor'] = meta['net_args']['abstractor']
-    dec_log['extractor'] = meta['net_args']['extractor']
+    dec_log['abstractor'] = model.meta['net_args']['abstractor']
+    dec_log['extractor'] = model.meta['net_args']['extractor']
     dec_log['rl'] = True
     dec_log['split'] = split
-    dec_log['beam'] = beam_size
-    dec_log['diverse'] = diverse
+    dec_log['beam'] = model.beam_size
+    dec_log['diverse'] = model.diverse
     with open(join(save_path, 'log.json'), 'w') as f:
         json.dump(dec_log, f, indent=4)
 
@@ -70,24 +105,7 @@ def decode(save_path, model_dir, split, batch_size,
     i = 0
     with torch.no_grad():
         for i_debug, raw_article_batch in enumerate(loader):
-            tokenized_article_batch = map(tokenize(None), raw_article_batch)
-            ext_arts = []
-            ext_inds = []
-            for raw_art_sents in tokenized_article_batch:
-                ext = extractor(raw_art_sents)[:-1]  # exclude EOE
-                if not ext:
-                    # use top-5 if nothing is extracted
-                    # in some rare cases rnn-ext does not extract at all
-                    ext = list(range(5))[:len(raw_art_sents)]
-                else:
-                    ext = [i.item() for i in ext]
-                ext_inds += [(len(ext_arts), len(ext))]
-                ext_arts += [raw_art_sents[i] for i in ext]
-            if beam_size > 1:
-                all_beams = abstractor(ext_arts, beam_size, diverse)
-                dec_outs = rerank_mp(all_beams, ext_inds)
-            else:
-                dec_outs = abstractor(ext_arts)
+            dec_outs, ext_inds = model.decode(raw_article_batch)
             assert i == batch_size*i_debug
             for j, n in ext_inds:
                 decoded_sents = [' '.join(dec) for dec in dec_outs[j:j+n]]
@@ -164,6 +182,6 @@ if __name__ == '__main__':
     args.cuda = torch.cuda.is_available() and not args.no_cuda
 
     data_split = 'test' if args.test else 'val'
-    decode(args.path, args.model_dir,
-           data_split, args.batch, args.beam, args.div,
-           args.max_dec_word, args.cuda)
+    decode_all(args.path, args.model_dir,
+               data_split, args.batch, args.beam, args.div,
+               args.max_dec_word, args.cuda)
