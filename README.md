@@ -1,3 +1,5 @@
+# FORK FROM github.com/ChenRocks
+
 # Fast Abstractive Summarization-RL
 This repository contains the code for our ACL 2018 paper:
 
@@ -19,8 +21,8 @@ If you use this code, please cite our paper:
 ```
 
 ## Dependencies
-- **Python 3** (tested on python 3.6)
-- [PyTorch](https://github.com/pytorch/pytorch) 0.4.0
+- **Python 3** (tested on python 3.6.8)
+- [PyTorch](https://github.com/pytorch/pytorch) 1.3.0
     - with GPU and CUDA enabled installation (though the code is runnable on CPU, it would be way too slow)
 - [gensim](https://github.com/RaRe-Technologies/gensim)
 - [cytoolz](https://github.com/pytoolz/cytoolz)
