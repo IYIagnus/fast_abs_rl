@@ -77,13 +77,17 @@ def get_count(path):
 
 
 def write(input_path, split):
-    """Reads the tokenized patent files and writes them to a out_file.
+    """Reads the tokenized patent files and writes them to an out_file.
     """
     print("Writing {}\n".format(split))
     path = join(input_path, 'tokens', split)
     output_path = join(input_path, 'finished_files', split)
     os.makedirs(output_path, exist_ok=True)
     count = get_count(path)
+
+    if split == 'train':
+        vocab_counter = collections.Counter()
+
     for i in range(count):
         if i % 1000 == 0 or i == count-1:
             print("Writing file {} of {}\n".format(i+1, count))
@@ -100,7 +104,23 @@ def write(input_path, split):
         with open(join(output_path, f'{i}.json'), 'wb') as file:
             file.write(js_serialized)
 
+        # Write the vocab to file, if applicable
+        if split == 'train':
+            art_tokens = ' '.join(article_sents).split()
+            abs_tokens = ' '.join(abstract_sents).split()
+            tokens = art_tokens + abs_tokens
+            tokens = [t.strip() for t in tokens] # strip
+            tokens = [t for t in tokens if t != ""] # remove empty
+            vocab_counter.update(tokens)
+
     print("Finished writing {}\n".format(split))
+    # write vocab to file
+    if split == 'train':
+        print("Writing vocab file...")
+        with open(os.path.join(finished_files_dir, "vocab_cnt.pkl"),
+                  'wb') as vocab_file:
+            pkl.dump(vocab_counter, vocab_file)
+        print("Finished writing vocab file")
 
 
 if __name__ == '__main__':
