@@ -4,18 +4,24 @@ import re
 import os
 from os.path import join
 import pickle as pkl
-from itertools import starmap
+from itertools import starmap, product
+from collections import Counter, defaultdict
+from functools import reduce
+import operator as op
 
-from cytoolz import curry
+
+from cytoolz import identity, concat, curry
 
 import torch
+from torch import multiprocessing as mp
 
-from utils import PAD, UNK, START, END
-from model.copy_summ import CopySumm
-from model.extract import ExtractSumm, PtrExtractSumm
-from model.rl import ActorCritic
-from data.batcher import conver2id, pad_batch_tensorize
-from data.data import CnnDmDataset
+
+from .utils import PAD, UNK, START, END
+from .model.copy_summ import CopySumm
+from .model.extract import ExtractSumm, PtrExtractSumm
+from .model.rl import ActorCritic
+from .data.batcher import conver2id, pad_batch_tensorize, tokenize
+from .data.data import CnnDmDataset
 
 
 try:
@@ -51,6 +57,90 @@ def load_best_ckpt(model_dir, reverse=False):
         join(model_dir, 'ckpt/{}'.format(ckpts[0]))
     )['state_dict']
     return ckpt
+
+
+_PRUNE = defaultdict(
+    lambda: 2,
+    {1:5, 2:5, 3:5, 4:5, 5:5, 6:4, 7:3, 8:3}
+)
+
+def rerank(all_beams, ext_inds):
+    beam_lists = (all_beams[i: i+n] for i, n in ext_inds if n > 0)
+    return list(concat(map(rerank_one, beam_lists)))
+
+def rerank_mp(all_beams, ext_inds):
+    beam_lists = [all_beams[i: i+n] for i, n in ext_inds if n > 0]
+    with mp.Pool(8) as pool:
+        reranked = pool.map(rerank_one, beam_lists)
+    return list(concat(reranked))
+
+def rerank_one(beams):
+    @curry
+    def process_beam(beam, n):
+        for b in beam[:n]:
+            b.gram_cnt = Counter(_make_n_gram(b.sequence))
+        return beam[:n]
+    beams = map(process_beam(n=_PRUNE[len(beams)]), beams)
+    best_hyps = max(product(*beams), key=_compute_score)
+    dec_outs = [h.sequence for h in best_hyps]
+    return dec_outs
+
+def _make_n_gram(sequence, n=2):
+    return (tuple(sequence[i:i+n]) for i in range(len(sequence)-(n-1)))
+
+def _compute_score(hyps):
+    all_cnt = reduce(op.iadd, (h.gram_cnt for h in hyps), Counter())
+    repeat = sum(c-1 for g, c in all_cnt.items() if c > 1)
+    lp = sum(h.logprob for h in hyps) / sum(len(h.sequence) for h in hyps)
+    return (-repeat, lp)
+
+
+class Model:
+    def __init__(self, model_dir, beam_size, diverse, max_len, cuda):
+        self.extractor, self.abstractor, self.meta = self.load_model(model_dir, beam_size, max_len, cuda)
+        self.beam_size = beam_size
+        self.diverse = diverse
+        self.max_len = max_len
+        self.cuda = cuda
+
+    def load_model(self, model_dir, beam_size, max_len, cuda):
+        with open(join(model_dir, 'meta.json')) as f:
+            meta = json.loads(f.read())
+        if meta['net_args']['abstractor'] is None:
+            # NOTE: if no abstractor is provided then
+            #       the whole model would be extractive summarization
+            assert beam_size == 1
+            abstractor = identity
+        else:
+            if beam_size == 1:
+                abstractor = Abstractor(join(model_dir, 'abstractor'),
+                                        max_len, cuda)
+            else:
+                abstractor = BeamAbstractor(join(model_dir, 'abstractor'),
+                                            max_len, cuda)
+        extractor = RLExtractor(model_dir, cuda=cuda)
+        return extractor, abstractor, meta
+
+    def decode(self, raw_article_batch):
+        tokenized_article_batch = map(tokenize(None), raw_article_batch)
+        ext_arts = []
+        ext_inds = []
+        for raw_art_sents in tokenized_article_batch:
+            ext = self.extractor(raw_art_sents)[:-1]  # exclude EOE
+            if not ext:
+                # use top-5 if nothing is extracted
+                # in some rare cases rnn-ext does not extract at all
+                ext = list(range(5))[:len(raw_art_sents)]
+            else:
+                ext = [i.item() for i in ext]
+            ext_inds += [(len(ext_arts), len(ext))]
+            ext_arts += [raw_art_sents[i] for i in ext]
+        if self.beam_size > 1:
+            all_beams = self.abstractor(ext_arts, self.beam_size, self.diverse)
+            dec_outs = rerank_mp(all_beams, ext_inds)
+        else:
+            dec_outs = self.abstractor(ext_arts)
+        return dec_outs, ext_inds
 
 
 class Abstractor(object):
